@@ -12,8 +12,8 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
+          sudo apt update -qq
+          sudo apt install -y \
             libusb-dev \
             libusb-1.0-0-dev \
             libncurses5-dev \
@@ -27,8 +27,7 @@ jobs:
             librtlsdr-dev \
             libiniparser-dev \
             libavahi-client-dev \
-            portaudio19-dev \ 
-            uuid-dev
+            portaudio19-dev
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Setup
