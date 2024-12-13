@@ -19,6 +19,7 @@ jobs:
             libncurses5-dev \
             libfftw3-dev \
             libbsd-dev \
+            uuid-dev \
             libhackrf-dev \
             libogg-dev \
             libopus-dev \
@@ -27,8 +28,7 @@ jobs:
             librtlsdr-dev \
             libiniparser-dev \
             libavahi-client-dev \
-            portaudio19-dev \ 
-            uuid-dev
+            portaudio19-dev
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Setup
