@@ -251,6 +251,7 @@ struct channel {
     double shape;     // Analysis window parameter if any (kaiser β, gaussian σ)
     int fft_n;        // size of analysis FFT
     int fft_avg;      // Number of consecutive FFTs to average into each spectrum response
+    int accum_remaining; // Wideband: frames left to accumulate (0 = not accumulating)
     enum window_type window_type;
     float *window;    // Analysis window
     void *plan;       // FFTW plan - don't drag in <fftw.h>

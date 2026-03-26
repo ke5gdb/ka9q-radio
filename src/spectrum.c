@@ -26,6 +26,8 @@ static void setup_wideband(struct channel *);
 static void setup_narrowband(struct channel *);
 static void narrowband_poll(struct channel *);
 static void wideband_poll(struct channel *);
+static int wideband_poll_n(struct channel *, int count, double gain);
+static void wideband_update_scaling(struct channel *);
 #if RICE
 static void rice(struct channel *);
 #endif
@@ -91,6 +93,7 @@ int demod_spectrum(void *arg){
 
     // fairly major reinitialization required
     if(chan->spectrum.fft_n <= 0){
+      chan->spectrum.accum_remaining = 0; // cancel any in-progress accumulation
       if(chan->spectrum.plan != NULL)
 	fftwf_destroy_plan(chan->spectrum.plan); // will be regenerated on first poll
       chan->spectrum.plan = NULL;
@@ -110,8 +113,8 @@ int demod_spectrum(void *arg){
     int r = downconvert(chan);
     if(r == -1)
       break; // restart needed
-    if(r == 1 && !response_needed)
-      continue; // channel inactive and no pending response; poll for commands
+    if(r == 1 && !response_needed && chan->spectrum.accum_remaining <= 0)
+      continue; // channel inactive, no pending response, no accumulation in progress
 
     // r == 0 is normal return
     // Process receiver data only in narrowband mode
@@ -142,28 +145,51 @@ int demod_spectrum(void *arg){
       if(timeout < 0)
 	timeout = 0;
     }
-    if(response_needed){      // Generate new bin data for the next response
-      // Make sure output frequency bin data buffers exist
-      if(chan->spectrum.bin_data == NULL || chan->spectrum.bin_count != bin_count){
-	void *old = chan->spectrum.bin_data;
-	chan->spectrum.bin_data = realloc(chan->spectrum.bin_data, chan->spectrum.bin_count * sizeof *chan->spectrum.bin_data);
-	if(chan->spectrum.bin_data == NULL)
-	  FREE(old); // emulate reallocf()
-      }
-      if(chan->spectrum.rbw <= chan->spectrum.crossover){
-#if 0
-	// Don't run FFT more often than one FFT's worth of samples
-        if(timeout <= 0){
-	  narrowband_poll(chan);
-	  timeout = chan->spectrum.fft_n;
-	}
-#else
-	narrowband_poll(chan);
-#endif
-      } else
-	wideband_poll(chan);
+    // Ensure bin_data buffer exists and is correctly sized
+    if(chan->spectrum.bin_data == NULL || chan->spectrum.bin_count != bin_count){
+      void *old = chan->spectrum.bin_data;
+      chan->spectrum.bin_data = realloc(chan->spectrum.bin_data, chan->spectrum.bin_count * sizeof *chan->spectrum.bin_data);
+      if(chan->spectrum.bin_data == NULL)
+	FREE(old); // emulate reallocf()
+    }
+
+    if(response_needed && chan->spectrum.rbw > chan->spectrum.crossover){
+      // Wideband mode: start incremental accumulation across frames
+      int const fft_avg = chan->spectrum.fft_avg <= 0 ? 1 : chan->spectrum.fft_avg;
+      memset(chan->spectrum.bin_data, 0, chan->spectrum.bin_count * sizeof *chan->spectrum.bin_data);
+      chan->spectrum.accum_remaining = fft_avg;
+      response_needed = false; // defer until accumulation completes
+    }
+
+    if(chan->spectrum.accum_remaining > 0 && chan->spectrum.rbw > chan->spectrum.crossover){
+      // Wideband incremental: process a batch of FFT frames from the latest data
+      // Each downconvert cycle delivers block_samples new samples; fit as many FFTs as possible
+      int const fft_avg = chan->spectrum.fft_avg <= 0 ? 1 : chan->spectrum.fft_avg;
+      int const fft_step = lrint(chan->spectrum.fft_n * (1. - chan->spectrum.overlap));
+      int const block_samples = lrint(chan->frontend->samprate * Blocktime);
+      int batch = block_samples / fft_step; // FFTs that fit in one block of new data
+      if(batch < 1)
+	batch = 1;
+      if(batch > chan->spectrum.accum_remaining)
+	batch = chan->spectrum.accum_remaining;
+      double const gain = 1./(double)((int64_t)fft_avg * chan->spectrum.fft_n * chan->spectrum.fft_n);
+      chan->spectrum.accum_remaining -= wideband_poll_n(chan, batch, gain);
+      if(chan->spectrum.accum_remaining <= 0){
+	wideband_update_scaling(chan);
+	response_needed = true; // accumulation complete, send response
 #ifdef RICE
-      rice(chan); // experiment with rice encoding
+	rice(chan);
+#endif
+      }
+    } else if(response_needed){
+      // Narrowband mode or immediate response needed
+      if(chan->spectrum.rbw <= chan->spectrum.crossover){
+	narrowband_poll(chan);
+      } else {
+	wideband_poll(chan); // fallback: single-shot
+      }
+#ifdef RICE
+      rice(chan);
 #endif
     }
     // Remember new values in case they change next time
@@ -296,22 +322,25 @@ static void narrowband_poll(struct channel *chan){
   }
 }
 
-static void wideband_poll(struct channel *chan){
-  if(chan == NULL)
-    return;
+// Process 'count' FFT frames from the most recent data in the frontend A/D buffer
+// Reads backward from write pointer with overlap between frames
+// Adds results to bin_data (caller must zero bin_data before first call of a new accumulation)
+// gain should include the 1/total_avg normalization factor
+// Returns number of frames actually processed
+static int wideband_poll_n(struct channel *chan, int count, double gain){
+  if(chan == NULL || count <= 0)
+    return 0;
 
-  // Wideband mode poll
   struct frontend const * restrict const frontend = chan->frontend;
   if(frontend == NULL)
-    return;
+    return 0;
 
-  // These can happen if we're called too early, before allocations
   struct filter_in const * const restrict master = chan->filter.out.master;
   if(master == NULL)
-    return;
+    return 0;
 
   int const fft_n = chan->spectrum.fft_n;
-  assert(fft_n > 0); // should be set by setup_wideband()
+  assert(fft_n > 0);
 
   if(chan->spectrum.plan == NULL){
     if(chan->frontend->isreal)
@@ -322,123 +351,95 @@ static void wideband_poll(struct channel *chan){
   fftwf_plan restrict const plan = chan->spectrum.plan;
   assert(plan != NULL);
 
-  // should be set up just before we were called
   int const bin_count = chan->spectrum.bin_count;
   float * restrict const bin_data = chan->spectrum.bin_data;
   assert(bin_count > 0 && bin_data != NULL);
-  memset(bin_data,0, bin_count * sizeof *bin_data); // zero output data
 
   if(chan->spectrum.window == NULL)
     generate_window(chan);
   float const * restrict const window = chan->spectrum.window;
   assert(window != NULL);
 
-  // Asynchronously read newest data from input buffer
-  // Look back two FFT blocks from the most recent write pointer to allow room for overlapping windows
-  // scale fft bin shift down to size of analysis FFT, which is smaller than the input FFT
   int shift = (int)(chan->filter.bin_shift * (int64_t)fft_n / master->points);
-
-  // scale each bin value for our FFT
-  // squared because the we're scaling the output of complex norm, not the input bin values
-  // we only see one side of the spectrum for real inputs
-  int const fft_avg = chan->spectrum.fft_avg <= 0 ? 1 : chan->spectrum.fft_avg; // force it valid
+  int processed = 0;
 
   if(frontend->isreal){
-    // Point into raw SDR A/D input ring buffer
-    // We're reading from a mirrored buffer so it will automatically wrap back to the beginning
-    // as long as it doesn't go past twice the buffer length
-    float const *input = frontend->in.input_write_pointer.r - fft_n; // 1 FFT buffer back
+    float const *input = frontend->in.input_write_pointer.r - fft_n;
     if(input < (float *)frontend->in.input_buffer)
-      input += frontend->in.input_buffer_size / sizeof *input; // wrap backward
+      input += frontend->in.input_buffer_size / sizeof *input;
 
     float * restrict fft_in = fftwf_alloc_real(fft_n);
     assert(fft_in != NULL);
-    float complex * restrict fft_out = fftwf_alloc_complex(fft_n/2 + 1); // r2c has only the positive frequencies
+    float complex * restrict fft_out = fftwf_alloc_complex(fft_n/2 + 1);
     assert(fft_out != NULL);
-    double const gain = 2./(double)((int64_t)fft_avg * fft_n * fft_n); // +3dB to include the virtual conjugate spectrum
+    double const real_gain = 2.0 * gain; // +3dB to include the virtual conjugate spectrum
 
-    for(int iter=0; iter < fft_avg; iter++){
-      // Copy and window raw A/D
+    for(int iter = 0; iter < count; iter++){
       if(shift >= 0){
-	// Upright spectrum
 	for(int i=0; i < fft_n; i++)
 	  fft_in[i] = window[i] * input[i];
       } else {
-	// Invert spectrum by flipping sign of every other sample - UNTESTED
-	// equivalent to multiplication by a sinusoid at the Nyquist rate
-	// If FFT N is odd, just forget the odd last sample.
-	// We don't have to track the sign flip phase because we're only summing energy
 	for(int i=0; i < fft_n-1; i += 2){
 	  fft_in[i] = window[i] * input[i];
 	  fft_in[i+1] = -window[i+1] * input[i+1];
 	}
 	if(fft_n & 1)
 	  fft_in[fft_n-1] = 0;
-	shift = -shift; // make positive
+	shift = -shift;
       }
       fftwf_execute_dft_r2c(plan,fft_in,fft_out);
 
-      // Spectrum is always right side up so shift is never negative
-      // Start with DC + positive frequencies, then wrap to negative
       int binp = shift;
       assert(binp >= 0);
       for(int i=0;i < bin_count && binp < fft_n/2+1 ; i++,binp++){
 	if(i == bin_count/2)
-	  binp -= bin_count; // crossed into negative output rang, Wrap input back to lowest frequency requested
-
+	  binp -= bin_count;
 	double const p = cnrm(fft_out[binp]);
 	assert(isfinite(p));
 	if(isfinite(p))
-	  bin_data[i] += gain * p;
+	  bin_data[i] += real_gain * p;
       }
-      input -= lrint(fft_n * (1. - chan->spectrum.overlap)); // move back fraction of a buffer
+      processed++;
+      input -= lrint(fft_n * (1. - chan->spectrum.overlap));
       if(input < (float *)frontend->in.input_buffer)
-	input += frontend->in.input_buffer_size / sizeof *input; // wrap backward
+	input += frontend->in.input_buffer_size / sizeof *input;
     }
     fftwf_free(fft_in);
     fftwf_free(fft_out);
   } else {
-    // Complex front end (frontend->isreal == false)
-    // Find starting points to read in input A/D stream
-    // UNTESTED
-    float complex const * restrict input = frontend->in.input_write_pointer.c - fft_n; // 1 buffer back
-    input += (input < (float complex *)frontend->in.input_buffer) ? frontend->in.input_buffer_size / sizeof *input : 0; // backward wrap
+    // Complex front end
+    float complex const * restrict input = frontend->in.input_write_pointer.c - fft_n;
+    input += (input < (float complex *)frontend->in.input_buffer) ? frontend->in.input_buffer_size / sizeof *input : 0;
     float complex * restrict fft_in = fftwf_alloc_complex(fft_n);
     assert(fft_in != NULL);
     float complex * restrict fft_out = fftwf_alloc_complex(fft_n);
     assert(fft_out != NULL);
-    double const gain = 1./(double)((int64_t)fft_avg * fft_n * fft_n); // check this
 
-    for(int iter=0; iter < fft_avg; iter++){
-      // Copy and window raw A/D
+    for(int iter = 0; iter < count; iter++){
       for(int i=0; i < fft_n; i++)
 	fft_in[i] = window[i] * input[i];
 
       fftwf_execute_dft(plan,fft_in,fft_out);
 
-      // Copy requested bins to user, starting with requested frequency
       int binp;
       int i = 0;
 
       if(shift >= 0){
-	// Starts in positive spectrum
-	if(shift >= fft_n/2) // starts past end of spectrum, nothing to return
-	  goto done;
+	if(shift >= fft_n/2)
+	  goto skip;
 	binp = shift;
       } else {
-	// shift < 0, starts in negative spectrum
 	if(-shift >= fft_n)
-	  goto done; // Nothing overlaps, quit
-	if(-shift >= fft_n/2){ // before start of input spectrum
+	  goto skip;
+	if(-shift >= fft_n/2){
 	  i = -shift - fft_n/2;
-	  binp = fft_n/2; // start input at lowest negative frequency
+	  binp = fft_n/2;
 	} else {
 	  binp = fft_n + shift;
 	}
       }
       for(; i < bin_count; i++){
 	if(i == bin_count/2){
-	  // Jump from end of positive frequencies to start of negative frequencies
 	  binp -= bin_count;
 	  if(binp < 0)
 	    binp += fft_n;
@@ -450,22 +451,47 @@ static void wideband_poll(struct channel *chan){
 	  bin_data[i] += gain * p;
 
 	if(++binp == fft_n)
-	  binp = 0; // wrap to DC
+	  binp = 0;
       }
-    done:;
-
-      // Back to previous buffer
+    skip:;
+      processed++;
       input -= lrint(fft_n * (1. - chan->spectrum.overlap));
       if(input < (float complex *)frontend->in.input_buffer)
-	input += frontend->in.input_buffer_size / sizeof *input; // backward wrap
+	input += frontend->in.input_buffer_size / sizeof *input;
     }
     fftwf_free(fft_in);
     fftwf_free(fft_out);
   }
+  return processed;
+}
+
+// Original single-shot wrapper: process all fft_avg frames at once from existing buffer
+static void wideband_poll(struct channel *chan){
+  if(chan == NULL)
+    return;
+
+  int const bin_count = chan->spectrum.bin_count;
+  float * restrict const bin_data = chan->spectrum.bin_data;
+  if(bin_count <= 0 || bin_data == NULL)
+    return;
+  memset(bin_data,0, bin_count * sizeof *bin_data);
+
+  int const fft_avg = chan->spectrum.fft_avg <= 0 ? 1 : chan->spectrum.fft_avg;
+  int const fft_n = chan->spectrum.fft_n;
+  double const gain = 1./(double)((int64_t)fft_avg * fft_n * fft_n);
+
+  wideband_poll_n(chan, fft_avg, gain);
+  wideband_update_scaling(chan);
+}
+
+// Update base/step scaling after accumulation is complete
+static void wideband_update_scaling(struct channel *chan){
+  int const bin_count = chan->spectrum.bin_count;
+  float const * restrict const bin_data = chan->spectrum.bin_data;
+
   double min_power = INFINITY;
   double max_power = 0;
 
-  // scaling for byte bin format
   for(int i=0; i < bin_count; i++){
     if(bin_data[i] < min_power)
       min_power = bin_data[i];
@@ -475,17 +501,15 @@ static void wideband_poll(struct channel *chan){
   if(max_power > 0 && min_power > 0){
 #if SPECTRUM_CLIP
     chan->spectrum.base = power2dB(chan->sig.n0 * chan->spectrum.noise_bw);
-
 #else
     chan->spectrum.base = power2dB(min_power);
 #endif
 #if FIXED_STEP
-    chan->spectrum.step = 0.5; // 0.25 dB fixed
+    chan->spectrum.step = 0.5;
 #else
-    chan->spectrum.step = ldexp(power2dB(max_power) - chan->spectrum.base,-8); // dB range
+    chan->spectrum.step = ldexp(power2dB(max_power) - chan->spectrum.base,-8);
 #endif
   }
-
 }
 
 // Fill a buffer with compact frequency bin data, 1 byte each

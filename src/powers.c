@@ -148,150 +148,162 @@ int main(int argc,char *argv[]){
   // which is hard to do in one command, as we'd have to stash the ssrc somewhere.
   while(true){
     uint8_t buffer[PKTSIZE];
-    uint8_t *bp = buffer;
-    *bp++ = 1; // Command
 
-    encode_int(&bp,OUTPUT_SSRC,Ssrc);
-    uint32_t tag = (uint32_t)random();
-    encode_int(&bp,COMMAND_TAG,tag);
-    encode_int(&bp,DEMOD_TYPE,SPECT_DEMOD);
-    if(frequency >= 0)
-      encode_double(&bp,RADIO_FREQUENCY,frequency); // 0 frequency means terminate
-    if(bins > 0)
-      encode_int(&bp,BIN_COUNT,bins);
-    if(rbw > 0)
-      encode_float(&bp,RESOLUTION_BW,rbw);
-    if(crossover >= 0)
-      encode_float(&bp,CROSSOVER,crossover);
-    // Integrate over the full interval: each FFT covers 1/rbw seconds
-    if(rbw > 0 && interval > 0){
-      int avg = (int)(interval * rbw);
-      if(avg < 1)
-	avg = 1;
-      encode_int(&bp,SPECTRUM_AVG,avg);
-    }
-    encode_eol(&bp);
-    ssize_t const command_len = bp - buffer;
-    if(Verbose > 1){
-      fprintf(stderr,"Sent:");
-      dump_metadata(stderr,buffer+1,command_len-1,details ? true : false);
-    }
-    if(sendto(Ctl_fd, buffer, command_len, 0, &Metadata_dest_socket, sizeof Metadata_dest_socket) != command_len){
-      perror("command send");
-      usleep(10000); // 10 millisec
+    // Accumulate power over the interval by polling repeatedly
+    double accum[PKTSIZE / sizeof(float)]; // double for accumulation precision
+    memset(accum, 0, sizeof(accum));
+    int polls = 0;
+    size_t npower = 0;
+    uint64_t time = 0;
+    double r_freq = 0;
+    double r_rbw = 0;
+    int64_t const interval_end = gps_time_ns() + (int64_t)(interval * BILLION);
+
+    do {
+      // Build command with fresh tag each poll
+      uint8_t *bp = buffer;
+      *bp++ = 1; // Command
+      encode_int(&bp,OUTPUT_SSRC,Ssrc);
+      uint32_t tag = (uint32_t)random();
+      encode_int(&bp,COMMAND_TAG,tag);
+      encode_int(&bp,DEMOD_TYPE,SPECT_DEMOD);
+      if(frequency >= 0)
+	encode_double(&bp,RADIO_FREQUENCY,frequency);
+      if(bins > 0)
+	encode_int(&bp,BIN_COUNT,bins);
+      if(rbw > 0)
+	encode_float(&bp,RESOLUTION_BW,rbw);
+      if(crossover >= 0)
+	encode_float(&bp,CROSSOVER,crossover);
+      // Set server-side integration count
+      // With 50% overlap (default), each FFT step advances fft_n/2 samples = 1/(2*rbw) sec
+      // So frames needed = interval / (1/(2*rbw)) = interval * rbw * 2
+      if(rbw > 0 && interval > 0){
+	int avg = (int)(interval * rbw * 2);
+	if(avg < 1)
+	  avg = 1;
+	encode_int(&bp,SPECTRUM_AVG,avg);
+      }
+      encode_eol(&bp);
+      ssize_t const cmd_len = bp - buffer;
+
+      if(Verbose > 1){
+	fprintf(stderr,"Sent:");
+	dump_metadata(stderr,buffer+1,cmd_len-1,details ? true : false);
+      }
+      if(sendto(Ctl_fd, buffer, cmd_len, 0, &Metadata_dest_socket, sizeof Metadata_dest_socket) != cmd_len){
+	perror("command send");
+	usleep(10000);
+	continue;
+      }
+      // Deadline must cover server-side integration time
+      int64_t poll_timeout = Timeout;
+      if(rbw > 0 && interval > 0){
+	int64_t integration_ns = (int64_t)(interval * BILLION) + BILLION;
+	if(integration_ns > poll_timeout)
+	  poll_timeout = integration_ns;
+      }
+      int64_t deadline = gps_time_ns() + poll_timeout;
+      ssize_t length = 0;
+      do {
+	fd_set fdset;
+	FD_ZERO(&fdset);
+	FD_SET(Status_fd,&fdset);
+	int n = Status_fd + 1;
+	int64_t timeout = deadline - gps_time_ns();
+	if(timeout < 0)
+	  timeout = 0;
+	struct timespec ts;
+	ns2ts(&ts,timeout);
+	n = pselect(n,&fdset,NULL,NULL,&ts,NULL);
+	if(n <= 0 && timeout == 0)
+	  break; // timed out waiting for this poll
+	if(!FD_ISSET(Status_fd,&fdset))
+	  continue;
+	socklen_t ssize = sizeof(Metadata_source_socket);
+	length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&Metadata_source_socket,&ssize);
+      } while(length < 2 || (enum pkt_type)buffer[0] != STATUS || Ssrc != get_ssrc(buffer+1,length-1) || tag != get_tag(buffer+1,length-1));
+
+      if(length < 2)
+	continue; // timed out, try again
+
+      if(Verbose > 1){
+	fprintf(stderr,"Received:");
+	dump_metadata(stderr,buffer+1,length-1,details ? true : false);
+      }
+      float poll_powers[PKTSIZE / sizeof(float)];
+      size_t np = extract_powers(poll_powers,sizeof(poll_powers) / sizeof(poll_powers[0]),
+				 &time,&r_freq,&r_rbw,Ssrc,buffer+1,length-1);
+      if(np <= 0){
+	if(Verbose)
+	  fprintf(stderr,"Invalid response, length %lu\n",np);
+	continue;
+      }
+      if(npower == 0)
+	npower = np; // first valid response sets the bin count
+      else if(np != npower)
+	continue; // bin count changed, skip
+
+      for(size_t i = 0; i < npower; i++)
+	accum[i] += poll_powers[i];
+      polls++;
+    } while(gps_time_ns() < interval_end);
+
+    if(polls == 0 || npower == 0){
+      fprintf(stderr,"No valid responses during interval\n");
       goto again;
     }
-    // Deadline must cover the integration time plus margin for processing
-    int64_t response_timeout = Timeout;
-    if(rbw > 0 && interval > 0){
-      int64_t integration_ns = (int64_t)(interval * BILLION) + BILLION; // interval + 1s margin
-      if(integration_ns > response_timeout)
-	response_timeout = integration_ns;
-    }
-    int64_t deadline = gps_time_ns() + response_timeout;
-    ssize_t length = 0;
-    do {
-      // Wait for a reply to our query
-      // ignore all packets on group without changing deadline
-      fd_set fdset;
-      FD_ZERO(&fdset);
-      FD_SET(Status_fd,&fdset);
-      int n = Status_fd + 1;
-      int64_t timeout = deadline - gps_time_ns();
-      // Immediate poll if timeout is negative
-      if(timeout < 0)
-	timeout = 0;
-      struct timespec ts;
-      ns2ts(&ts,timeout);
-      n = pselect(n,&fdset,NULL,NULL,&ts,NULL);
-      if(n <= 0 && timeout == 0){
-	usleep(10000); // rate limit, just in case
-	goto again;
-      }
-      if(!FD_ISSET(Status_fd,&fdset))
-	continue;
-      // Read message on the multicast group
-      socklen_t ssize = sizeof(Metadata_source_socket);
-      length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&Metadata_source_socket,&ssize);
+    // Average the accumulated powers
+    for(size_t i = 0; i < npower; i++)
+      accum[i] /= polls;
 
-      // Ignore invalid packets, non-status packets, packets re other SSRCs and packets not in response to our polls
-      // Should we insist on the same command tag, or accept any "recent" status packet, e.g., triggered by the control program?
-      // This is needed because an initial delay in joining multicast groups produces a burst of buffered responses; investigate this
-    } while(length < 2 || (enum pkt_type)buffer[0] != STATUS || Ssrc != get_ssrc(buffer+1,length-1) || tag != get_tag(buffer+1,length-1));
+    if(Verbose)
+      fprintf(stderr,"Integrated %d polls over %.1f sec\n",polls,interval);
 
-    if(Verbose > 1){
-      fprintf(stderr,"Received:");
-      dump_metadata(stderr,buffer+1,length-1,details ? true : false);
-    }
-    float powers[PKTSIZE / sizeof(float)]; // floats in a max size IP packet
-    uint64_t time;
-    double r_freq;
-    double r_rbw;
-
-    size_t npower = extract_powers(powers,sizeof(powers) / sizeof (powers[0]), &time,&r_freq,&r_rbw,Ssrc,buffer+1,length-1);
-    if(npower <= 0){
-      fprintf(stderr,"Invalid response, length %lu\n",npower);
-      usleep(10000); // 10 millisec
-      continue; // Invalid for some reason; retry
-    }
     // Note from VK5QI:
     // the output format from that utility matches that produced by rtl_power, which is:
     //2022-04-02, 16:24:55, 400050181, 401524819, 450.13, 296, -52.95, -53.27, -53.26, -53.24, -53.40, <many more points here>
     // date, time, start_frequency, stop_frequency, bin_size_hz, number_bins, data0, data1, data2
 
-    // **************Process here ***************
     char gps[1024];
     printf("%s,",format_gpstime_iso8601(gps,sizeof(gps),time));
 
-    // Frequencies below center; note integer round-up, e.g, 65 -> 33; 64 -> 32
-    // npower odd: emit N/2+1....N-1 0....N/2 (division truncating to integer)
-    // npower even: emit N/2....N-1 0....N/2-1
-    size_t const first_neg_bin = (npower + 1)/2; // round up, e.g., 64->32, 65 -> 33, 66 -> 33
-    double base = r_freq - r_rbw * (npower/2); // integer truncation (round down), e.g., 64-> 32, 65 -> 32
+    size_t const first_neg_bin = (npower + 1)/2;
+    double base = r_freq - r_rbw * (npower/2);
     printf(" %.0lf, %.0lf, %.0lf, %lu",
 	   base, base + r_rbw * (npower-1), r_rbw, npower);
 
     // Find lowest non-zero entry, use the same for zero power to avoid -infinity dB
-    // Zero power in any bin is unlikely unless they're all zero, but handle it anyway
     double lowest = INFINITY;
     for(size_t i=0; i < npower; i++){
-      if(powers[i] < 0){
-	fprintf(stderr,"Invalid power %g in response\n",powers[i]);
-	usleep(10000); // 10 millisec
-	goto again; // negative powers are invalid
+      if(accum[i] < 0){
+	fprintf(stderr,"Invalid power %g in response\n",accum[i]);
+	goto again;
       }
-      if(powers[i] > 0 && powers[i] < lowest)
-	lowest = powers[i];
+      if(accum[i] > 0 && accum[i] < lowest)
+	lowest = accum[i];
     }
     double const min_db = lowest != INFINITY ? power2dB(lowest) : 0;
 
     if (details){
-      // Frequencies below center
       printf("\n");
       for(size_t i=first_neg_bin ; i < npower; i++){
-        printf("%lu %lf %.2lf\n",i,base,(powers[i] == 0) ? min_db : power2dB(powers[i]));
+        printf("%lu %lf %.2lf\n",i,base,(accum[i] == 0) ? min_db : power2dB(accum[i]));
         base += r_rbw;
       }
-      // Frequencies above center
       for(size_t i=0; i < first_neg_bin; i++){
-        printf("%lu %lf %.2lf\n",i,base,(powers[i] == 0) ? min_db : power2dB(powers[i]));
+        printf("%lu %lf %.2lf\n",i,base,(accum[i] == 0) ? min_db : power2dB(accum[i]));
         base += r_rbw;
       }
     } else {
       for(size_t i= first_neg_bin; i < npower; i++)
-        printf(", %.2lf",(powers[i] == 0) ? min_db : power2dB(powers[i]));
-      // Frequencies above center
+        printf(", %.2lf",(accum[i] == 0) ? min_db : power2dB(accum[i]));
       for(size_t i=0; i < first_neg_bin; i++)
-        printf(", %.2lf",(powers[i] == 0) ? min_db : power2dB(powers[i]));
+        printf(", %.2lf",(accum[i] == 0) ? min_db : power2dB(accum[i]));
     }
     printf("\n");
     if(--count == 0)
       break;
-
-    // Server-side integration covers the interval, so no additional sleep needed
-    // Fall back to client-side sleep only if integration wasn't configured
-    if(rbw <= 0 || interval <= 0)
-      usleep((useconds_t)(interval * 1e6));
   again:;
   }
   exit(0);
