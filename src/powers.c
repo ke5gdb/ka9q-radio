@@ -163,6 +163,13 @@ int main(int argc,char *argv[]){
       encode_float(&bp,RESOLUTION_BW,rbw);
     if(crossover >= 0)
       encode_float(&bp,CROSSOVER,crossover);
+    // Integrate over the full interval: each FFT covers 1/rbw seconds
+    if(rbw > 0 && interval > 0){
+      int avg = (int)(interval * rbw);
+      if(avg < 1)
+	avg = 1;
+      encode_int(&bp,SPECTRUM_AVG,avg);
+    }
     encode_eol(&bp);
     ssize_t const command_len = bp - buffer;
     if(Verbose > 1){
@@ -174,8 +181,14 @@ int main(int argc,char *argv[]){
       usleep(10000); // 10 millisec
       goto again;
     }
-    // The deadline starts at 1 sec after a command
-    int64_t deadline = gps_time_ns() + Timeout;
+    // Deadline must cover the integration time plus margin for processing
+    int64_t response_timeout = Timeout;
+    if(rbw > 0 && interval > 0){
+      int64_t integration_ns = (int64_t)(interval * BILLION) + BILLION; // interval + 1s margin
+      if(integration_ns > response_timeout)
+	response_timeout = integration_ns;
+    }
+    int64_t deadline = gps_time_ns() + response_timeout;
     ssize_t length = 0;
     do {
       // Wait for a reply to our query
@@ -275,9 +288,10 @@ int main(int argc,char *argv[]){
     if(--count == 0)
       break;
 
-    // need to add randomized wait and avoidance of poll if response elicited by other poller (eg., control) comes in first
-    // And if we decide to use those responses (currently blocked by command tag check)
-    usleep((useconds_t)(interval * 1e6));
+    // Server-side integration covers the interval, so no additional sleep needed
+    // Fall back to client-side sleep only if integration wasn't configured
+    if(rbw <= 0 || interval <= 0)
+      usleep((useconds_t)(interval * 1e6));
   again:;
   }
   exit(0);
