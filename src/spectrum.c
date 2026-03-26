@@ -91,7 +91,7 @@ int demod_spectrum(void *arg){
 
     // fairly major reinitialization required
     if(chan->spectrum.fft_n <= 0){
-      if(chan->spectrum.plan == NULL)
+      if(chan->spectrum.plan != NULL)
 	fftwf_destroy_plan(chan->spectrum.plan); // will be regenerated on first poll
       chan->spectrum.plan = NULL;
       FREE(chan->spectrum.window); // force regeneration on first poll
@@ -110,12 +110,12 @@ int demod_spectrum(void *arg){
     int r = downconvert(chan);
     if(r == -1)
       break; // restart needed
-    else if(r == 1)
-      continue; // channel inactive; poll for commands
+    if(r == 1 && !response_needed)
+      continue; // channel inactive and no pending response; poll for commands
 
     // r == 0 is normal return
     // Process receiver data only in narrowband mode
-    if(chan->spectrum.rbw <= chan->spectrum.crossover && chan->baseband != NULL){
+    if(r == 0 && chan->spectrum.rbw <= chan->spectrum.crossover && chan->baseband != NULL){
       if(chan->spectrum.ring == NULL || chan->spectrum.ring_size < chan->spectrum.fft_avg * chan->spectrum.fft_n){
 
 	// Need a new or bigger baseband ring buffer
@@ -145,7 +145,7 @@ int demod_spectrum(void *arg){
     if(response_needed){      // Generate new bin data for the next response
       // Make sure output frequency bin data buffers exist
       if(chan->spectrum.bin_data == NULL || chan->spectrum.bin_count != bin_count){
-	void *old = chan->spectrum.ring;
+	void *old = chan->spectrum.bin_data;
 	chan->spectrum.bin_data = realloc(chan->spectrum.bin_data, chan->spectrum.bin_count * sizeof *chan->spectrum.bin_data);
 	if(chan->spectrum.bin_data == NULL)
 	  FREE(old); // emulate reallocf()
@@ -436,19 +436,22 @@ static void wideband_poll(struct channel *chan){
 	  binp = fft_n + shift;
 	}
       }
-      do {
+      for(; i < bin_count; i++){
+	if(i == bin_count/2){
+	  // Jump from end of positive frequencies to start of negative frequencies
+	  binp -= bin_count;
+	  if(binp < 0)
+	    binp += fft_n;
+	}
 	assert(binp >= 0 && binp < fft_n && i >= 0 && i < bin_count);
 	double const p = cnrm(fft_out[binp]);
 	assert(isfinite(p));
 	if(isfinite(p))
 	  bin_data[i] += gain * p;
 
-	// Increment and wrap indices
-	if(++i == bin_count)
-	  i = 0; // wrap to DC
 	if(++binp == fft_n)
 	  binp = 0; // wrap to DC
-      } while(i != bin_count/2 && binp != fft_n/2); // upper ends of positive frequncies
+      }
     done:;
 
       // Back to previous buffer
