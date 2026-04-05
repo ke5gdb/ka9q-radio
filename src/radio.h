@@ -252,9 +252,15 @@ struct channel {
     int fft_n;        // size of analysis FFT
     int fft_avg;      // Number of consecutive FFTs to average into each spectrum response
     int accum_remaining; // Wideband: frames left to accumulate (0 = not accumulating)
+    double accum_gain;   // Precomputed 1/(fft_avg*fft_n^2), set when accumulation starts
+    int accum_step;      // Precomputed lrint(fft_n*(1-overlap)) samples/FFT step, set when accumulation starts
+    int accum_batch_max; // Precomputed max FFT frames per downconvert cycle, set when accumulation starts
     enum window_type window_type;
     float *window;    // Analysis window
     void *plan;       // FFTW plan - don't drag in <fftw.h>
+    float *fft_in_r;         // Persistent real FFT input buffer (real wideband only), size fft_n
+    float complex *fft_in_c; // Persistent complex FFT input buffer (complex wideband + narrowband), size fft_n
+    float complex *fft_out;  // Persistent FFT output buffer, size fft_n (large enough for r2c and c2c)
     float complex *ring; // Ring buffer of demodulated data in narrowband mode
     int ring_size;
     int ring_idx;     // index into ring buffer
