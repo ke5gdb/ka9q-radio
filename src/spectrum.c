@@ -426,8 +426,12 @@ static int wideband_poll_n(struct channel *chan, int count, double gain){
 	if(i == bin_count/2)
 	  binp -= bin_count; // crossed into negative output range, wrap input back to lowest frequency requested
 	double const p = cnrm(fft_out[binp]);
-	if(isfinite(p))
-	  bin_data[i] += real_gain * p;
+	if(isfinite(p)){
+	  // DC (binp==0) and Nyquist (binp==fft_n/2) are purely real in a real FFT —
+	  // they have no conjugate pair, so don't apply the 2x conjugate-symmetry factor.
+	  double const g = (binp == 0 || binp == fft_n/2) ? gain : real_gain;
+	  bin_data[i] += g * p;
+	}
       }
       processed++;
       input -= fft_step; // move back by one step (accounts for overlap)
