@@ -371,14 +371,20 @@ static void wideband_poll(struct channel *chan){
     assert(fft_out != NULL);
     double const gain = 2./(double)((int64_t)fft_avg * fft_n * fft_n); // +3dB to include the virtual conjugate spectrum
 
+    // Decide inversion once, before the averaging loop, so every iteration is treated
+    // the same and we don't mutate shift across iterations
+    bool const invert = shift < 0; // inverting LO / even Nyquist zone
+    if(invert)
+      shift = -shift; // make positive for bin extraction below
+
     for(int iter=0; iter < fft_avg; iter++){
       // Copy and window raw A/D
-      if(shift >= 0){
+      if(!invert){
 	// Upright spectrum
 	for(int i=0; i < fft_n; i++)
 	  fft_in[i] = window[i] * input[i];
       } else {
-	// Invert spectrum by flipping sign of every other sample - UNTESTED
+	// Invert spectrum by flipping sign of every other sample
 	// equivalent to multiplication by a sinusoid at the Nyquist rate
 	// If FFT N is odd, just forget the odd last sample.
 	// We don't have to track the sign flip phase because we're only summing energy
@@ -388,11 +394,10 @@ static void wideband_poll(struct channel *chan){
 	}
 	if(fft_n & 1)
 	  fft_in[fft_n-1] = 0;
-	shift = -shift; // make positive
       }
       fftwf_execute_dft_r2c(plan,fft_in,fft_out);
 
-      // Spectrum is always right side up so shift is never negative
+      // Spectrum is now right side up so shift is never negative
       // Start with DC + positive frequencies, then wrap to negative
       int binp = shift;
       assert(binp >= 0);
